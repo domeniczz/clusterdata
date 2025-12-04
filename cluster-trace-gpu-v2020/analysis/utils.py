@@ -209,13 +209,14 @@ def get_hourly_task_request(df): # df = dftjkix
     sum_df_list = []
     df = add_hour_date(df.copy())
     # for day in sorted(df.dayofyear.unique()):
-    for date in sorted(df.date.unique()):
+    valid_dates = [d for d in pd.unique(df['date']) if pd.notnull(d)]
+    for date in sorted(valid_dates):
         # tempdf = df[df.dayofyear==day]
         tempdf = df[df.date==date]
         res_df = tempdf.groupby('hour').count()[['job_name']]
         res_df.rename(columns={'job_name':date}, inplace=True)
         sum_df_list.append(res_df.T)
-    out_df = pd.DataFrame().append(sum_df_list)
+    out_df = pd.concat(sum_df_list) if len(sum_df_list) > 0 else pd.DataFrame()
     return out_df.dropna() # if a day contains hours of NaN, it is not a typical day
 
 def get_hourly_task_resource_request(df, metrics='cpu'): # df = dftjkix
@@ -230,13 +231,14 @@ def get_hourly_task_resource_request(df, metrics='cpu'): # df = dftjkix
     else:
         exit()
     # for day in sorted(df.dayofyear.unique()):
-    for date in sorted(df.date.unique()):
+    valid_dates = [d for d in pd.unique(df['date']) if pd.notnull(d)]
+    for date in sorted(valid_dates):
         # tempdf = df[df.dayofyear==day]
         tempdf = df[df.date==date]
-        res_df = tempdf.groupby('hour').sum()[['plan_resource']]
-        res_df.rename(columns={'job_name':date}, inplace=True)
+        res_df = tempdf.groupby('hour')['plan_resource'].sum().to_frame()
+        res_df.rename(columns={'plan_resource':date}, inplace=True)
         sum_df_list.append(res_df.T)
-    out_df = pd.DataFrame().append(sum_df_list)
+    out_df = pd.concat(sum_df_list) if len(sum_df_list) > 0 else pd.DataFrame()
     return out_df.dropna() # if a day contains hours of NaN, it is not a typical day
 
 def plan_minus_usg_over_cap_task(dfas):
