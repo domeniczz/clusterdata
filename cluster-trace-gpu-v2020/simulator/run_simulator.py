@@ -1,11 +1,14 @@
 # usage: python3 run_simulator.py & date
 
 from simulator import Simulator
-from utils import print_fn, ALLOC_POLICY_DICT, PREEMPT_POLICY_DICT
+from utils import (print_fn, ALLOC_POLICY_DICT, PREEMPT_POLICY_DICT,
+                   plot_job_stats, plot_cluster_util,
+                   plot_multi_job_stats, plot_multi_cluster_util)
 import os
 import time
 import logging
 import argparse
+import glob
 from pathlib import Path
 
 DATE = "%02d%02d" % (time.localtime().tm_mon, time.localtime().tm_mday)
@@ -48,10 +51,10 @@ PATTERN = 0  # Cluster capacity varying pattern
 # GPU_TYPE_MATCHING = 2 # Only V100 cannot compromise
 GPU_TYPE_MATCHING = 0
 
-EXPORT_JOB_STATS = False
-# EXPORT_JOB_STATS = True
-EXPORT_CLUSTER_UTIL = False
-# EXPORT_CLUSTER_UTIL = True
+# EXPORT_JOB_STATS = False
+EXPORT_JOB_STATS = True
+# EXPORT_CLUSTER_UTIL = False
+EXPORT_CLUSTER_UTIL = True
 
 # RANDOM_SEED = random.randint(0, 100)
 RANDOM_SEED = 42
@@ -153,3 +156,61 @@ for item in items:
     print_fn(print_str, level=2)
 
 print("\nlog_file: %s" % log_file)
+
+# ============ Generate Figures ============
+if EXPORT_JOB_STATS or EXPORT_CLUSTER_UTIL:
+    print("\n==========")
+    print("Generating figures...")
+    
+    # Create figures directory
+    FIGURES_DIR = Path(__file__).parent / 'figures'
+    if not os.path.exists(FIGURES_DIR):
+        os.makedirs(FIGURES_DIR)
+    
+    # Collect generated .npy files from this run using the log file name pattern
+    log_file_name = log_file.name  # Get just the filename
+    log_file_stem = log_file_name  # Keep .log in pattern since npy files have .log. in name
+    
+    # Search in LOG_DIR for matching npy files
+    job_stats_files = sorted(LOG_DIR.glob(f"{log_file_stem}*job_stats.npy"))
+    cluster_util_files = sorted(LOG_DIR.glob(f"{log_file_stem}*cluster_util.npy"))
+    
+    print(f"Looking for files matching: {log_file_stem}*")
+    print(f"Found {len(job_stats_files)} job_stats files, {len(cluster_util_files)} cluster_util files")
+    
+    # Generate individual plots for each policy
+    if EXPORT_JOB_STATS and job_stats_files:
+        for npyfile in job_stats_files:
+            try:
+                plot_job_stats(str(npyfile))
+                png_path = str(npyfile).replace('.npy', '.png')
+                print(f"  Generated: {Path(png_path).name}")
+            except Exception as e:
+                print(f"  Error plotting {npyfile.name}: {e}")
+    
+    if EXPORT_CLUSTER_UTIL and cluster_util_files:
+        for npyfile in cluster_util_files:
+            try:
+                plot_cluster_util(str(npyfile))
+                png_path = str(npyfile).replace('.npy', '.png')
+                print(f"  Generated: {Path(png_path).name}")
+            except Exception as e:
+                print(f"  Error plotting {npyfile.name}: {e}")
+    
+    # Generate comparison plots across all policies
+    if EXPORT_JOB_STATS and len(job_stats_files) > 1:
+        try:
+            plot_multi_job_stats([str(f) for f in job_stats_files])
+            print(f"  Generated multi-policy job_stats comparison")
+        except Exception as e:
+            print(f"  Error generating multi-policy job stats plot: {e}")
+    
+    if EXPORT_CLUSTER_UTIL and len(cluster_util_files) > 1:
+        try:
+            plot_multi_cluster_util([str(f) for f in cluster_util_files])
+            print(f"  Generated multi-policy cluster_util comparison")
+        except Exception as e:
+            print(f"  Error generating multi-policy cluster util plot: {e}")
+    
+    print("\nFigures saved to: %s" % LOG_DIR)
+    print("==========")
