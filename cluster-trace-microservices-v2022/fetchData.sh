@@ -27,8 +27,9 @@ fetch_data() {
             file_name="${file_names[$i]}_$idx.tar.gz"
             remote_path="${remote_paths[$i]}_$idx.tar.gz"
             url="https://aliopentrace.oss-cn-beijing.aliyuncs.com/v2022MicroservicesTraces/$remote_path"
-            command="wget -c --retry-connrefused --tries=0 --timeout=50 -O $file_name $url"
-            $command
+            curl -L -C - --retry 3 --connect-timeout 50 -k \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                -o "$file_name" "$url"
         done
     done
 }
