@@ -128,16 +128,16 @@ class ModelConfig:
     lgb_num_leaves: int = 31
     
     # Training parameters
-    batch_size: int = 64
-    learning_rate: float = 0.001
-    num_epochs: int = 100
-    early_stopping_patience: int = 15
-    weight_decay: float = 1e-5
+    batch_size: int = 32
+    learning_rate: float = 0.0005
+    num_epochs: int = 200
+    early_stopping_patience: int = 20
+    weight_decay: float = 1e-4
     gradient_clip: float = 1.0
     
     # Learning rate scheduler
     scheduler_factor: float = 0.5
-    scheduler_patience: int = 5
+    scheduler_patience: int = 10
     
     # Data split ratios (time-based split)
     train_ratio: float = 0.7

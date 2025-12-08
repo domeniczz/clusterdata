@@ -671,11 +671,16 @@ class DataModule:
         self,
         msname: str,
         features: List[str] = None,
-        normalize: bool = True,
+        normalize: bool = False,
         add_features: bool = True
     ) -> Optional[pd.DataFrame]:
         """
         Prepare time series data for a specific microservice.
+        
+        Note: normalize is now False by default. Normalization should be done 
+        in create_dataloaders() AFTER splitting to avoid data leakage.
+        Set normalize=True only if you need pre-normalized data and understand
+        the implications.
         """
         # Use merged data if available, otherwise use msmetrics
         data_source = self.merged_data if self.merged_data is not None else self.msmetrics_data
@@ -708,8 +713,9 @@ class DataModule:
         if ts_data is None:
             return None
         
-        # Normalize if requested
+        # Normalize if explicitly requested (not recommended - use create_dataloaders instead)
         if normalize:
+            print("Warning: Pre-normalizing data. This may cause data leakage if used with create_dataloaders().")
             ts_data = self.preprocessor.normalize_features(ts_data)
         
         self.service_timeseries[msname] = ts_data
@@ -738,62 +744,111 @@ class DataModule:
         self,
         data: np.ndarray,
         target_idx: int = 0,
-        shuffle_train: bool = True
-    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        shuffle_train: bool = False,
+        normalize: bool = True
+    ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
         """
         Create train, validation, and test DataLoaders with TIME-BASED split.
+        
         Important: For time series, we must preserve temporal order.
+        The data is split chronologically (train -> val -> test) and by default
+        shuffle_train=False to maintain temporal dependencies within the training set.
+        
+        IMPORTANT: Normalization is now done AFTER splitting to avoid data leakage.
+        The scaler is fit only on training data and applied to val/test.
+        
+        Args:
+            data: Numpy array of shape (num_timestamps, num_features)
+            target_idx: Index of target feature in data
+            shuffle_train: Whether to shuffle training data. Default False to preserve
+                          temporal order for time series. Set True only if you understand
+                          the implications for time series forecasting.
+            normalize: Whether to normalize data (default True). Normalization is
+                      applied after splitting to avoid data leakage.
+        
+        Returns:
+            Tuple of (train_loader, val_loader, test_loader). 
+            If train dataset creation fails, raises ValueError instead of returning None.
+            val_loader and test_loader may be None if insufficient data.
+        
+        Raises:
+            ValueError: If there is insufficient data to create the training dataset.
         """
         n = len(data)
         
-        # Time-based split (no shuffling of the split itself)
+        # Time-based split (chronological order preserved)
         train_end = int(n * self.model_config.train_ratio)
         val_end = int(n * (self.model_config.train_ratio + self.model_config.val_ratio))
         
-        # Split data
-        train_data = data[:train_end]
-        val_data = data[train_end:val_end]
-        test_data = data[val_end:]
+        # Split data chronologically
+        train_data = data[:train_end].copy()
+        val_data = data[train_end:val_end].copy()
+        test_data = data[val_end:].copy()
+        
+        # Apply normalization AFTER split (fit on train only) to avoid data leakage
+        if normalize:
+            from sklearn.preprocessing import MinMaxScaler
+            self._data_scaler = MinMaxScaler()
+            train_data = self._data_scaler.fit_transform(train_data)
+            if len(val_data) > 0:
+                val_data = self._data_scaler.transform(val_data)
+            if len(test_data) > 0:
+                test_data = self._data_scaler.transform(test_data)
         
         print(f"Data split - Train: {len(train_data)}, Val: {len(val_data)}, Test: {len(test_data)}")
         
-        # Create datasets
-        try:
-            train_dataset = WorkloadTimeSeriesDataset(
-                train_data,
-                seq_length=self.model_config.seq_length,
-                pred_length=self.model_config.pred_length,
-                target_idx=target_idx
+        # Create training dataset (required)
+        min_required = self.model_config.seq_length + self.model_config.pred_length
+        if len(train_data) < min_required:
+            raise ValueError(
+                f"Insufficient training data: {len(train_data)} samples, "
+                f"need at least {min_required} (seq_length={self.model_config.seq_length} + "
+                f"pred_length={self.model_config.pred_length}). "
+                f"Try loading more data files or reducing sequence length."
             )
-        except ValueError as e:
-            print(f"Warning: {e}")
-            return None, None, None
         
-        try:
-            val_dataset = WorkloadTimeSeriesDataset(
-                val_data,
-                seq_length=self.model_config.seq_length,
-                pred_length=self.model_config.pred_length,
-                target_idx=target_idx
-            )
-        except ValueError:
-            val_dataset = None
+        train_dataset = WorkloadTimeSeriesDataset(
+            train_data,
+            seq_length=self.model_config.seq_length,
+            pred_length=self.model_config.pred_length,
+            target_idx=target_idx
+        )
         
-        try:
-            test_dataset = WorkloadTimeSeriesDataset(
-                test_data,
-                seq_length=self.model_config.seq_length,
-                pred_length=self.model_config.pred_length,
-                target_idx=target_idx
-            )
-        except ValueError:
-            test_dataset = None
+        # Create validation dataset (optional)
+        val_dataset = None
+        if len(val_data) >= min_required:
+            try:
+                val_dataset = WorkloadTimeSeriesDataset(
+                    val_data,
+                    seq_length=self.model_config.seq_length,
+                    pred_length=self.model_config.pred_length,
+                    target_idx=target_idx
+                )
+            except ValueError as e:
+                print(f"Warning: Could not create validation dataset: {e}")
+        else:
+            print(f"Warning: Insufficient validation data ({len(val_data)} samples)")
+        
+        # Create test dataset (optional)
+        test_dataset = None
+        if len(test_data) >= min_required:
+            try:
+                test_dataset = WorkloadTimeSeriesDataset(
+                    test_data,
+                    seq_length=self.model_config.seq_length,
+                    pred_length=self.model_config.pred_length,
+                    target_idx=target_idx
+                )
+            except ValueError as e:
+                print(f"Warning: Could not create test dataset: {e}")
+        else:
+            print(f"Warning: Insufficient test data ({len(test_data)} samples)")
         
         # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.model_config.batch_size,
-            shuffle=shuffle_train,
+            shuffle=shuffle_train,  # Default False for time series
             num_workers=0,
             drop_last=True
         )
@@ -803,16 +858,16 @@ class DataModule:
             batch_size=self.model_config.batch_size,
             shuffle=False,
             num_workers=0
-        ) if val_dataset else None
+        ) if val_dataset is not None else None
         
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.model_config.batch_size,
             shuffle=False,
             num_workers=0
-        ) if test_dataset else None
+        ) if test_dataset is not None else None
         
-        print(f"Train samples: {len(train_dataset) if train_dataset else 0}")
+        print(f"Train samples: {len(train_dataset)}")
         print(f"Val samples: {len(val_dataset) if val_dataset else 0}")
         print(f"Test samples: {len(test_dataset) if test_dataset else 0}")
         
@@ -872,10 +927,12 @@ class DataModule:
         )
         
         # Create dataloaders
+        # Note: shuffle=False for time series to preserve temporal patterns
+        # Each service's data maintains its temporal order within the pooled dataset
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.model_config.batch_size,
-            shuffle=True,
+            shuffle=False,  # Preserve temporal order for time series
             num_workers=0
         )
         

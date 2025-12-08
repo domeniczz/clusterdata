@@ -86,6 +86,21 @@ class EarlyStopping:
         self.early_stop = False
 
 
+class HuberLoss(nn.Module):
+    """Huber Loss - robust to outliers."""
+    def __init__(self, delta: float = 1.0):
+        super().__init__()
+        self.delta = delta
+        
+    def forward(self, pred, target):
+        diff = torch.abs(pred - target)
+        return torch.where(
+            diff < self.delta,
+            0.5 * diff ** 2,
+            self.delta * (diff - 0.5 * self.delta)
+        ).mean()
+
+
 class WorkloadTrainer:
     """
     Trainer class for workload prediction models.
@@ -97,8 +112,17 @@ class WorkloadTrainer:
         model: nn.Module,
         model_config: 'ModelConfig' = None,
         exp_config: 'ExperimentConfig' = None,
-        device: str = None
+        device: str = None,
+        loss_type: str = 'mse'
     ):
+        """
+        Args:
+            model: PyTorch model to train
+            model_config: Model configuration
+            exp_config: Experiment configuration
+            device: Device to use ('cuda' or 'cpu')
+            loss_type: Loss function type ('mse', 'huber', 'mae')
+        """
         self.model_config = model_config or MODEL_CONFIG
         self.exp_config = exp_config or EXPERIMENT_CONFIG
         
@@ -116,8 +140,13 @@ class WorkloadTrainer:
         # Move model to device
         self.model = model.to(self.device)
         
-        # Loss function
-        self.criterion = nn.MSELoss()
+        # Loss function - Huber loss is more robust for workload prediction
+        if loss_type == 'huber':
+            self.criterion = HuberLoss(delta=0.5)
+        elif loss_type == 'mae':
+            self.criterion = nn.L1Loss()
+        else:
+            self.criterion = nn.MSELoss()
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -423,9 +452,25 @@ def run_deep_learning_experiment(
     seq_length: int = None,
     num_epochs: int = None,
     verbose: bool = True,
+    loss_type: str = 'mse',
     **model_kwargs
 ) -> Dict:
-    """Run a complete experiment with a deep learning model."""
+    """
+    Run a complete experiment with a deep learning model.
+    
+    Args:
+        model_type: Type of model to train
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        test_loader: Test data loader
+        input_size: Number of input features
+        output_size: Number of output values (prediction horizon)
+        seq_length: Input sequence length
+        num_epochs: Number of training epochs
+        verbose: Whether to print progress
+        loss_type: Loss function ('mse', 'huber', 'mae'). 
+                   'huber' is recommended for workload prediction.
+    """
     if verbose:
         print("\n" + "=" * 60)
         print(f"Running Experiment: {model_type.upper()}")
@@ -445,8 +490,8 @@ def run_deep_learning_experiment(
     if verbose:
         print(f"Model parameters: {info['trainable_params']:,}")
     
-    # Create trainer
-    trainer = WorkloadTrainer(model)
+    # Create trainer with configurable loss
+    trainer = WorkloadTrainer(model, loss_type=loss_type)
     
     # Train
     metrics = trainer.train(train_loader, val_loader, num_epochs, verbose=verbose)

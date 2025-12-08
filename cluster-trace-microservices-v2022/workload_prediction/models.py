@@ -131,11 +131,6 @@ class AttentionLSTM(nn.Module):
     LSTM with attention mechanism for time series prediction.
     Combines LSTM's sequential processing with attention's ability
     to focus on important time steps.
-    
-    FIXED VERSION:
-    - Added layer normalization for training stability
-    - Improved attention mechanism with proper scaling
-    - Added residual connection for better gradient flow
     """
     
     def __init__(
@@ -250,7 +245,8 @@ class PositionalEncoding(nn.Module):
         
         pe[:, 0::2] = torch.sin(position * div_term)
         if d_model > 1:
-            pe[:, 1::2] = torch.cos(position * div_term[:d_model // 2])
+            cos_positions = min(d_model // 2, len(div_term))
+            pe[:, 1::2] = torch.cos(position * div_term[:cos_positions])
         pe = pe.unsqueeze(0)
         
         self.register_buffer('pe', pe)
@@ -533,7 +529,11 @@ class NLinear(nn.Module):
         x = x + seq_last
         
         # Return only the target feature (first feature)
-        return x[:, :, 0].squeeze(-1)
+        out = x[:, :, 0]  # (batch, pred_length)
+        # Squeeze only if pred_length == 1 to get (batch,)
+        if self.pred_length == 1:
+            return out.squeeze(-1)
+        return out
 
 
 class MovingAvgBlock(nn.Module):

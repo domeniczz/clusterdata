@@ -50,6 +50,10 @@ class WorkloadAnalyzer:
         """
         Smart sampling that preserves data distribution.
         Uses stratified sampling to maintain service diversity.
+        
+        The method ensures the final sample size respects self.sample_size by:
+        1. First performing stratified sampling to preserve service diversity
+        2. Then capping the result if it exceeds the limit
         """
         if len(df) <= self.sample_size:
             return df
@@ -59,12 +63,23 @@ class WorkloadAnalyzer:
         if preserve_services and 'msname' in df.columns:
             # Stratified sampling by service
             n_services = df['msname'].nunique()
+            # Calculate samples per service, with minimum 100 for diversity
             samples_per_service = max(100, self.sample_size // n_services)
             
             sampled = df.groupby('msname', group_keys=False).apply(
                 lambda x: x.sample(n=min(len(x), samples_per_service), random_state=42)
             )
-            return sampled.reset_index(drop=True)
+            sampled = sampled.reset_index(drop=True)
+            
+            # Cap the final sample size to respect self.sample_size
+            # This can happen when max(100, ...) overrides the calculated samples_per_service
+            # (e.g., 20000 services * 100 min samples = 2M > sample_size of 1M)
+            if len(sampled) > self.sample_size:
+                print(f"  [Sampling] Stratified sample exceeded limit ({len(sampled):,}), "
+                      f"reducing to {self.sample_size:,}")
+                sampled = sampled.sample(n=self.sample_size, random_state=42)
+            
+            return sampled
         else:
             # Simple random sampling
             return df.sample(n=self.sample_size, random_state=42)
