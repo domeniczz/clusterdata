@@ -190,13 +190,24 @@ class ExperimentConfig:
     ])
     
     deep_learning_models: List[str] = field(default_factory=lambda: [
+        # RNN-based models
         "lstm",            # Standard LSTM
         "gru",             # GRU (lighter than LSTM)
-        "attention_lstm",  # LSTM with attention
-        "tcn",             # Temporal Convolutional Network
+        "attention_lstm",  # LSTM with attention (FIXED version)
+        
+        # Transformer-based models (SOTA)
         "transformer",     # Transformer encoder
-        "nlinear",         # NLinear (simple but effective)
-        "dlinear"          # DLinear (decomposition + linear)
+        "patchtst",        # PatchTST (ICLR 2023) - patches + transformer
+        "informer",        # Informer (AAAI 2021) - long sequence forecasting
+        "autoformer",      # Autoformer (NeurIPS 2021) - auto-correlation
+        
+        # CNN-based models
+        "tcn",             # Temporal Convolutional Network
+        "timesnet",        # TimesNet (ICLR 2023) - 2D convolution
+        
+        # Linear models (strong baselines)
+        "nlinear",         # NLinear (AAAI 2023) - simple but effective
+        "dlinear"          # DLinear (AAAI 2023) - decomposition + linear
     ])
     
     # Logging

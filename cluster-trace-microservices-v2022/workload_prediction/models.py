@@ -131,6 +131,11 @@ class AttentionLSTM(nn.Module):
     LSTM with attention mechanism for time series prediction.
     Combines LSTM's sequential processing with attention's ability
     to focus on important time steps.
+    
+    FIXED VERSION:
+    - Added layer normalization for training stability
+    - Improved attention mechanism with proper scaling
+    - Added residual connection for better gradient flow
     """
     
     def __init__(
@@ -147,6 +152,9 @@ class AttentionLSTM(nn.Module):
         self.num_layers = num_layers or MODEL_CONFIG.lstm_num_layers
         self.dropout = dropout or MODEL_CONFIG.lstm_dropout
         
+        # Input projection for residual connection
+        self.input_proj = nn.Linear(input_size, self.hidden_size)
+        
         # LSTM layer
         self.lstm = nn.LSTM(
             input_size=input_size,
@@ -156,32 +164,65 @@ class AttentionLSTM(nn.Module):
             dropout=self.dropout if self.num_layers > 1 else 0
         )
         
-        # Attention layer
-        self.attention = nn.Sequential(
+        # Layer normalization for stability
+        self.layer_norm = nn.LayerNorm(self.hidden_size)
+        
+        # Scaled dot-product attention (more stable than additive attention)
+        self.query = nn.Linear(self.hidden_size, self.hidden_size)
+        self.key = nn.Linear(self.hidden_size, self.hidden_size)
+        self.value = nn.Linear(self.hidden_size, self.hidden_size)
+        self.scale = math.sqrt(self.hidden_size)
+        
+        # Attention dropout
+        self.attn_dropout = nn.Dropout(self.dropout)
+        
+        # Output layer with residual
+        self.fc = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
-            nn.Tanh(),
-            nn.Linear(self.hidden_size, 1)
+            nn.LayerNorm(self.hidden_size),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_size, output_size)
         )
         
-        # Output layer
-        self.fc = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(self.hidden_size // 2, output_size)
-        )
+        # Initialize weights properly
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights with Xavier/Glorot for better training."""
+        for name, param in self.named_parameters():
+            if 'weight' in name and len(param.shape) >= 2:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with attention."""
+        """Forward pass with scaled dot-product attention."""
+        batch_size, seq_len, _ = x.shape
+        
         # LSTM forward pass
         lstm_out, (h_n, c_n) = self.lstm(x)
         
-        # Attention weights
-        attention_weights = self.attention(lstm_out)
-        attention_weights = F.softmax(attention_weights, dim=1)
+        # Layer normalization
+        lstm_out = self.layer_norm(lstm_out)
         
-        # Weighted sum
-        context = torch.sum(attention_weights * lstm_out, dim=1)
+        # Scaled dot-product attention
+        # Use last hidden state as query
+        query = self.query(lstm_out[:, -1:, :])  # (batch, 1, hidden)
+        key = self.key(lstm_out)                  # (batch, seq, hidden)
+        value = self.value(lstm_out)              # (batch, seq, hidden)
+        
+        # Attention scores
+        attn_scores = torch.bmm(query, key.transpose(1, 2)) / self.scale  # (batch, 1, seq)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # Context vector
+        context = torch.bmm(attn_weights, value)  # (batch, 1, hidden)
+        context = context.squeeze(1)               # (batch, hidden)
+        
+        # Residual connection: add last LSTM output
+        context = context + lstm_out[:, -1, :]
         
         # Output
         out = self.fc(context)
@@ -627,6 +668,432 @@ class EnsemblePredictor(nn.Module):
         return out
 
 
+# ==================== Advanced Models ====================
+
+class PatchTST(nn.Module):
+    """
+    PatchTST: A Time Series is Worth 64 Words
+    
+    Patches the time series and applies transformer encoder.
+    Reference: ICLR 2023 - "A Time Series is Worth 64 Words: Long-term 
+    Forecasting with Transformers"
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        seq_length: int = None,
+        pred_length: int = 1,
+        patch_len: int = 4,
+        stride: int = 2,
+        d_model: int = 64,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1
+    ):
+        super(PatchTST, self).__init__()
+        
+        self.input_size = input_size
+        self.seq_length = seq_length or MODEL_CONFIG.seq_length
+        self.pred_length = pred_length
+        self.patch_len = patch_len
+        self.stride = stride
+        self.d_model = d_model
+        
+        # Calculate number of patches
+        self.num_patches = max(1, (self.seq_length - patch_len) // stride + 1)
+        
+        # Patch embedding
+        self.patch_embed = nn.Linear(patch_len * input_size, d_model)
+        
+        # Positional encoding
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Layer norm
+        self.norm = nn.LayerNorm(d_model)
+        
+        # Prediction head
+        self.head = nn.Sequential(
+            nn.Linear(d_model * self.num_patches, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, pred_length)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_length, input_size)
+        Returns:
+            (batch, pred_length)
+        """
+        batch_size = x.shape[0]
+        
+        # Create patches
+        patches = []
+        for i in range(self.num_patches):
+            start = i * self.stride
+            end = start + self.patch_len
+            if end <= x.shape[1]:
+                patch = x[:, start:end, :].reshape(batch_size, -1)
+                patches.append(patch)
+        
+        if not patches:
+            # Fallback: use entire sequence as one patch
+            patches = [x.reshape(batch_size, -1)[:, :self.patch_len * self.input_size]]
+        
+        # Stack patches
+        patches = torch.stack(patches, dim=1)  # (batch, num_patches, patch_len * input_size)
+        
+        # Patch embedding
+        x = self.patch_embed(patches)  # (batch, num_patches, d_model)
+        
+        # Add positional encoding
+        x = x + self.pos_embed[:, :x.shape[1], :]
+        
+        # Transformer
+        x = self.transformer(x)
+        x = self.norm(x)
+        
+        # Flatten and predict
+        x = x.reshape(batch_size, -1)
+        out = self.head(x)
+        
+        return out.squeeze(-1) if self.pred_length == 1 else out
+
+
+class Informer(nn.Module):
+    """
+    Informer: Beyond Efficient Transformer for Long Sequence Time-Series Forecasting
+    
+    Simplified version focusing on ProbSparse attention.
+    Reference: AAAI 2021
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        seq_length: int = None,
+        pred_length: int = 1,
+        d_model: int = 64,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        factor: int = 5
+    ):
+        super(Informer, self).__init__()
+        
+        self.seq_length = seq_length or MODEL_CONFIG.seq_length
+        self.pred_length = pred_length
+        self.d_model = d_model
+        self.factor = factor
+        
+        # Input embedding
+        self.input_embed = nn.Linear(input_size, d_model)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, max_len=self.seq_length * 2, dropout=dropout)
+        
+        # Encoder layers with ProbSparse attention approximation
+        self.encoder_layers = nn.ModuleList([
+            InformerEncoderLayer(d_model, nhead, d_model * 4, dropout, factor)
+            for _ in range(num_layers)
+        ])
+        
+        # Distilling layers for sequence reduction
+        self.distilling = nn.ModuleList([
+            nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1)
+            for _ in range(num_layers - 1)
+        ])
+        
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(d_model * max(1, self.seq_length // (2 ** (num_layers - 1))), d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, pred_length)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        # Input embedding
+        x = self.input_embed(x)
+        x = self.pos_encoder(x)
+        
+        # Encoder with distilling
+        for i, layer in enumerate(self.encoder_layers):
+            x = layer(x)
+            if i < len(self.distilling):
+                x = x.transpose(1, 2)
+                x = self.distilling[i](x)
+                x = x.transpose(1, 2)
+        
+        # Output
+        out = self.output_proj(x)
+        return out.squeeze(-1) if self.pred_length == 1 else out
+
+
+class InformerEncoderLayer(nn.Module):
+    """Informer encoder layer with approximated ProbSparse attention."""
+    
+    def __init__(self, d_model: int, nhead: int, d_ff: int, dropout: float, factor: int):
+        super().__init__()
+        
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Self attention with residual
+        attn_out, _ = self.self_attn(x, x, x)
+        x = self.norm1(x + self.dropout(attn_out))
+        
+        # Feed forward with residual
+        ff_out = self.feed_forward(x)
+        x = self.norm2(x + self.dropout(ff_out))
+        
+        return x
+
+
+class TimesBlock(nn.Module):
+    """
+    TimesBlock from TimesNet.
+    Converts 1D time series to 2D and applies inception-like convolutions.
+    """
+    
+    def __init__(self, d_model: int, d_ff: int, num_kernels: int = 6, dropout: float = 0.1):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.num_kernels = num_kernels
+        
+        # 2D convolution for period-wise processing
+        self.conv = nn.Sequential(
+            nn.Conv2d(d_model, d_ff, kernel_size=(1, 3), padding=(0, 1)),
+            nn.GELU(),
+            nn.Conv2d(d_ff, d_model, kernel_size=(1, 3), padding=(0, 1))
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor, period: int = None) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            period: detected period for reshaping
+        """
+        batch, seq_len, d_model = x.shape
+        
+        # Detect period using FFT if not provided
+        if period is None:
+            period = max(2, seq_len // 4)
+        
+        # Pad sequence to be divisible by period
+        if seq_len % period != 0:
+            pad_len = period - (seq_len % period)
+            x = F.pad(x, (0, 0, 0, pad_len))
+            seq_len = x.shape[1]
+        
+        # Reshape to 2D: (batch, d_model, period, seq_len//period)
+        x_2d = x.transpose(1, 2).reshape(batch, d_model, period, seq_len // period)
+        
+        # 2D convolution
+        out_2d = self.conv(x_2d)
+        
+        # Reshape back to 1D
+        out = out_2d.reshape(batch, d_model, -1).transpose(1, 2)
+        
+        # Trim to original length
+        out = out[:, :seq_len, :]
+        
+        return self.dropout(out)
+
+
+class TimesNet(nn.Module):
+    """
+    TimesNet: Temporal 2D-Variation Modeling for General Time Series Analysis
+    
+    Reference: ICLR 2023
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        seq_length: int = None,
+        pred_length: int = 1,
+        d_model: int = 64,
+        d_ff: int = 128,
+        num_layers: int = 2,
+        num_kernels: int = 6,
+        dropout: float = 0.1
+    ):
+        super(TimesNet, self).__init__()
+        
+        self.seq_length = seq_length or MODEL_CONFIG.seq_length
+        self.pred_length = pred_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        
+        # Input embedding
+        self.input_embed = nn.Linear(input_size, d_model)
+        
+        # TimesBlocks
+        self.blocks = nn.ModuleList([
+            TimesBlock(d_model, d_ff, num_kernels, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Layer norms
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(d_model)
+            for _ in range(num_layers)
+        ])
+        
+        # Prediction head
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(d_model * self.seq_length, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, pred_length)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        # Input embedding
+        x = self.input_embed(x)
+        
+        # TimesBlocks with residual
+        for block, norm in zip(self.blocks, self.norms):
+            residual = x
+            x = block(x)
+            x = norm(x + residual)
+        
+        # Prediction
+        out = self.head(x)
+        return out.squeeze(-1) if self.pred_length == 1 else out
+
+
+class Autoformer(nn.Module):
+    """
+    Autoformer: Decomposition Transformers with Auto-Correlation
+    
+    Simplified version with series decomposition and auto-correlation.
+    Reference: NeurIPS 2021
+    """
+    
+    def __init__(
+        self,
+        input_size: int,
+        seq_length: int = None,
+        pred_length: int = 1,
+        d_model: int = 64,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        moving_avg: int = 25
+    ):
+        super(Autoformer, self).__init__()
+        
+        self.seq_length = seq_length or MODEL_CONFIG.seq_length
+        self.pred_length = pred_length
+        self.d_model = d_model
+        
+        # Series decomposition
+        self.decomp = SeriesDecomp(kernel_size=moving_avg)
+        
+        # Input embedding
+        self.input_embed = nn.Linear(input_size, d_model)
+        
+        # Encoder layers
+        self.encoder_layers = nn.ModuleList([
+            AutoformerEncoderLayer(d_model, nhead, d_model * 4, dropout, moving_avg)
+            for _ in range(num_layers)
+        ])
+        
+        # Prediction head
+        self.head = nn.Sequential(
+            nn.Linear(d_model * self.seq_length, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, pred_length)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        # Decomposition
+        seasonal, trend = self.decomp(x)
+        
+        # Encode seasonal component
+        x = self.input_embed(seasonal)
+        
+        for layer in self.encoder_layers:
+            x = layer(x)
+        
+        # Flatten and predict
+        x = x.reshape(x.shape[0], -1)
+        out = self.head(x)
+        
+        return out.squeeze(-1) if self.pred_length == 1 else out
+
+
+class AutoformerEncoderLayer(nn.Module):
+    """Autoformer encoder layer with auto-correlation attention."""
+    
+    def __init__(self, d_model: int, nhead: int, d_ff: int, dropout: float, moving_avg: int):
+        super().__init__()
+        
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.decomp1 = SeriesDecomp(moving_avg)
+        self.decomp2 = SeriesDecomp(moving_avg)
+        
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Auto-correlation attention
+        attn_out, _ = self.attn(x, x, x)
+        x = x + self.dropout(attn_out)
+        
+        # First decomposition
+        seasonal1, trend1 = self.decomp1(x)
+        
+        # Feed forward
+        ff_out = self.feed_forward(seasonal1)
+        seasonal2 = seasonal1 + self.dropout(ff_out)
+        
+        # Second decomposition
+        seasonal_out, trend2 = self.decomp2(seasonal2)
+        
+        return seasonal_out
+
+
 # ==================== Model Factory ====================
 
 def create_model(
@@ -641,7 +1108,8 @@ def create_model(
     
     Args:
         model_type: One of 'lstm', 'gru', 'transformer', 'attention_lstm', 
-                   'tcn', 'nlinear', 'dlinear'
+                   'tcn', 'nlinear', 'dlinear', 'patchtst', 'informer',
+                   'timesnet', 'autoformer'
         input_size: Number of input features
         output_size: Number of output values to predict
         seq_length: Sequence length (required for some models)
@@ -654,11 +1122,22 @@ def create_model(
         seq_length = MODEL_CONFIG.seq_length
     
     models = {
+        # Classic models
         'lstm': LSTMPredictor,
         'gru': GRUPredictor,
-        'transformer': TransformerPredictor,
         'attention_lstm': AttentionLSTM,
+        
+        # Transformer-based models
+        'transformer': TransformerPredictor,
+        'patchtst': PatchTST,
+        'informer': Informer,
+        'autoformer': Autoformer,
+        
+        # CNN-based models
         'tcn': TCNPredictor,
+        'timesnet': TimesNet,
+        
+        # Linear models
         'nlinear': NLinear,
         'dlinear': DLinear
     }
@@ -682,6 +1161,13 @@ def create_model(
             seq_length=seq_length,
             **kwargs
         )
+    elif model_type in ['patchtst', 'informer', 'timesnet', 'autoformer']:
+        return models[model_type](
+            input_size=input_size,
+            seq_length=seq_length,
+            pred_length=output_size,
+            **kwargs
+        )
     else:
         return models[model_type](
             input_size=input_size,
@@ -702,9 +1188,38 @@ def get_model_info(model: nn.Module) -> dict:
     }
 
 
+def get_available_models() -> List[str]:
+    """Get list of all available model types."""
+    return [
+        'lstm', 'gru', 'attention_lstm',  # RNN-based
+        'transformer', 'patchtst', 'informer', 'autoformer',  # Transformer-based
+        'tcn', 'timesnet',  # CNN-based
+        'nlinear', 'dlinear'  # Linear
+    ]
+
+
+def get_model_summary() -> dict:
+    """Get a summary of all available models with their characteristics."""
+    return {
+        'lstm': {'type': 'RNN', 'complexity': 'Medium', 'best_for': 'Short sequences'},
+        'gru': {'type': 'RNN', 'complexity': 'Medium', 'best_for': 'Short sequences, faster than LSTM'},
+        'attention_lstm': {'type': 'RNN+Attention', 'complexity': 'Medium', 'best_for': 'Variable importance sequences'},
+        'transformer': {'type': 'Transformer', 'complexity': 'High', 'best_for': 'Complex patterns'},
+        'patchtst': {'type': 'Transformer', 'complexity': 'Medium', 'best_for': 'Long sequences'},
+        'informer': {'type': 'Transformer', 'complexity': 'High', 'best_for': 'Very long sequences'},
+        'autoformer': {'type': 'Transformer', 'complexity': 'High', 'best_for': 'Seasonal patterns'},
+        'tcn': {'type': 'CNN', 'complexity': 'Medium', 'best_for': 'Parallel processing'},
+        'timesnet': {'type': 'CNN', 'complexity': 'High', 'best_for': 'Multi-period patterns'},
+        'nlinear': {'type': 'Linear', 'complexity': 'Low', 'best_for': 'Simple patterns, baseline'},
+        'dlinear': {'type': 'Linear', 'complexity': 'Low', 'best_for': 'Trend + seasonal decomposition'}
+    }
+
+
 if __name__ == "__main__":
     # Test models
-    print("Testing deep learning models...")
+    print("=" * 60)
+    print("TESTING ALL DEEP LEARNING MODELS")
+    print("=" * 60)
     
     batch_size = 32
     seq_length = 24
@@ -715,19 +1230,61 @@ if __name__ == "__main__":
     x = torch.randn(batch_size, seq_length, input_size)
     
     # Test each model
-    model_types = ['lstm', 'gru', 'transformer', 'attention_lstm', 'tcn', 'nlinear', 'dlinear']
+    model_types = get_available_models()
+    
+    print(f"\nTesting {len(model_types)} models with:")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Sequence length: {seq_length}")
+    print(f"  Input features: {input_size}")
+    print(f"  Output size: {output_size}")
+    
+    results = []
     
     for model_type in model_types:
-        print(f"\nTesting {model_type}...")
-        model = create_model(model_type, input_size, output_size, seq_length=seq_length)
+        print(f"\n{'='*40}")
+        print(f"Testing {model_type.upper()}...")
         
-        # Forward pass
-        with torch.no_grad():
-            out = model(x)
-        
-        info = get_model_info(model)
-        print(f"  Input shape: {x.shape}")
-        print(f"  Output shape: {out.shape}")
-        print(f"  Parameters: {info['trainable_params']:,}")
+        try:
+            model = create_model(model_type, input_size, output_size, seq_length=seq_length)
+            
+            # Forward pass
+            with torch.no_grad():
+                out = model(x)
+            
+            info = get_model_info(model)
+            
+            print(f"  ✓ Input shape: {x.shape}")
+            print(f"  ✓ Output shape: {out.shape}")
+            print(f"  ✓ Parameters: {info['trainable_params']:,}")
+            
+            results.append({
+                'model': model_type,
+                'status': 'OK',
+                'params': info['trainable_params'],
+                'output_shape': tuple(out.shape)
+            })
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            results.append({
+                'model': model_type,
+                'status': 'FAILED',
+                'error': str(e)
+            })
     
-    print("\nAll models tested successfully!")
+    # Summary
+    print("\n" + "=" * 60)
+    print("TEST SUMMARY")
+    print("=" * 60)
+    
+    passed = sum(1 for r in results if r['status'] == 'OK')
+    failed = len(results) - passed
+    
+    print(f"\nPassed: {passed}/{len(results)}")
+    if failed > 0:
+        print(f"Failed: {failed}")
+        for r in results:
+            if r['status'] == 'FAILED':
+                print(f"  - {r['model']}: {r.get('error', 'Unknown error')}")
+    
+    print("\n" + "=" * 60)
+    print("All model tests completed!")

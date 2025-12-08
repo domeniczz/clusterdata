@@ -146,7 +146,17 @@ def run_single_service_experiment(
     if verbose:
         print(f"\n--- Deep Learning Models ---")
     
-    dl_models = ['lstm', 'gru', 'attention_lstm', 'tcn', 'nlinear', 'dlinear']
+    # All available deep learning models for comprehensive comparison
+    dl_models = [
+        # RNN-based
+        'lstm', 'gru', 'attention_lstm',
+        # Transformer-based (SOTA)
+        'transformer', 'patchtst', 'informer', 'autoformer',
+        # CNN-based
+        'tcn', 'timesnet',
+        # Linear (strong baselines)
+        'nlinear', 'dlinear'
+    ]
     
     for model_type in dl_models:
         try:

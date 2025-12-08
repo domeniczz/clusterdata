@@ -575,8 +575,17 @@ def compare_all_models(
                 'num_params': 0
             })
     
-    # Deep learning models
-    dl_models = ['lstm', 'gru', 'attention_lstm', 'tcn', 'nlinear', 'dlinear']
+    # Deep learning models - including new SOTA models
+    dl_models = [
+        # RNN-based
+        'lstm', 'gru', 'attention_lstm',
+        # Transformer-based
+        'transformer', 'patchtst', 'informer', 'autoformer',
+        # CNN-based
+        'tcn', 'timesnet',
+        # Linear (strong baselines)
+        'nlinear', 'dlinear'
+    ]
     
     for model_type in dl_models:
         try:
@@ -778,6 +787,177 @@ def plot_model_comparison(
         plt.close()
     else:
         plt.show()
+
+
+def plot_comprehensive_comparison(
+    comparison_df: pd.DataFrame,
+    save_dir: str = None
+):
+    """
+    Generate comprehensive comparison plots for all models.
+    Creates multiple visualization types for publication-quality figures.
+    """
+    if save_dir is None:
+        save_dir = EXPERIMENT_CONFIG.figures_path
+    os.makedirs(save_dir, exist_ok=True)
+    
+    df = comparison_df.copy()
+    
+    # 1. Radar Chart for multi-metric comparison
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True), dpi=120)
+    
+    metrics = ['rmse', 'mae', 'smape']
+    available_metrics = [m for m in metrics if m in df.columns]
+    
+    if available_metrics and len(df) > 0:
+        # Normalize metrics (inverse for "lower is better")
+        normalized_df = df.copy()
+        for m in available_metrics:
+            max_val = df[m].max()
+            min_val = df[m].min()
+            if max_val > min_val:
+                normalized_df[m] = 1 - (df[m] - min_val) / (max_val - min_val)
+            else:
+                normalized_df[m] = 0.5
+        
+        # Add R² (higher is better, already correct direction)
+        if 'r2' in df.columns:
+            available_metrics.append('r2')
+            r2_vals = df['r2'].values
+            normalized_df['r2'] = (r2_vals - r2_vals.min()) / (r2_vals.max() - r2_vals.min() + 1e-8)
+        
+        angles = np.linspace(0, 2 * np.pi, len(available_metrics), endpoint=False).tolist()
+        angles += angles[:1]  # Complete the circle
+        
+        # Plot top 5 models
+        top_models = normalized_df.nsmallest(5, 'rmse' if 'rmse' in df.columns else available_metrics[0])
+        colors = plt.cm.Set2(np.linspace(0, 1, len(top_models)))
+        
+        for idx, (_, row) in enumerate(top_models.iterrows()):
+            values = [row[m] for m in available_metrics]
+            values += values[:1]
+            ax.plot(angles, values, 'o-', linewidth=2, label=row['model_type'], color=colors[idx])
+            ax.fill(angles, values, alpha=0.1, color=colors[idx])
+        
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels([m.upper() for m in available_metrics])
+        ax.set_title('Model Performance Radar Chart (Higher is Better)', fontsize=14, y=1.08)
+        ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'radar_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    # 2. Box plot for model categories
+    if 'model_class' in df.columns:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=120)
+        
+        for ax, metric in zip(axes, ['rmse', 'mae', 'r2']):
+            if metric in df.columns:
+                df.boxplot(column=metric, by='model_class', ax=ax)
+                ax.set_title(f'{metric.upper()} by Model Category')
+                ax.set_xlabel('')
+                ax.set_ylabel(metric.upper())
+        
+        plt.suptitle('Performance Distribution by Model Category', fontsize=14)
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'category_comparison.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    # 3. Performance vs Training Time scatter
+    if 'training_time' in df.columns and 'rmse' in df.columns:
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=120)
+        
+        # Color by model class
+        colors = {'Baseline': '#2ecc71', 'Deep Learning': '#3498db', 'deep_learning': '#3498db', 'baseline': '#2ecc71'}
+        
+        for _, row in df.iterrows():
+            color = colors.get(row.get('model_class', 'unknown'), '#95a5a6')
+            ax.scatter(row['training_time'], row['rmse'], c=color, s=100, alpha=0.7)
+            ax.annotate(row['model_type'], (row['training_time'], row['rmse']), 
+                       fontsize=8, ha='center', va='bottom')
+        
+        ax.set_xlabel('Training Time (seconds)', fontsize=12)
+        ax.set_ylabel('RMSE', fontsize=12)
+        ax.set_title('Model Performance vs Training Time', fontsize=14)
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'performance_vs_time.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    # 4. Ranking table visualization
+    fig, ax = plt.subplots(figsize=(12, 8), dpi=120)
+    ax.axis('off')
+    
+    # Create ranking table
+    ranking_df = df.sort_values('rmse' if 'rmse' in df.columns else df.columns[0])
+    ranking_df['Rank'] = range(1, len(ranking_df) + 1)
+    
+    cols_to_show = ['Rank', 'model_type']
+    for m in ['rmse', 'mae', 'mape', 'r2']:
+        if m in ranking_df.columns:
+            cols_to_show.append(m)
+    
+    display_df = ranking_df[cols_to_show].head(15)
+    
+    # Format numeric columns
+    for col in display_df.columns:
+        if col not in ['Rank', 'model_type']:
+            display_df[col] = display_df[col].apply(lambda x: f'{x:.4f}' if isinstance(x, float) else x)
+    
+    table = ax.table(
+        cellText=display_df.values,
+        colLabels=[c.upper() if c != 'model_type' else 'Model' for c in display_df.columns],
+        cellLoc='center',
+        loc='center',
+        colColours=['#f0f0f0'] * len(display_df.columns)
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    
+    # Highlight best model
+    table[(1, 0)].set_facecolor('#d4edda')
+    table[(1, 1)].set_facecolor('#d4edda')
+    
+    ax.set_title('Model Ranking Table', fontsize=14, pad=20)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'ranking_table.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Comprehensive comparison plots saved to: {save_dir}")
+
+
+def generate_latex_table(comparison_df: pd.DataFrame) -> str:
+    """
+    Generate LaTeX table code for publication.
+    """
+    df = comparison_df.sort_values('rmse' if 'rmse' in comparison_df.columns else comparison_df.columns[0])
+    
+    metrics = ['rmse', 'mae', 'mape', 'r2']
+    available = [m for m in metrics if m in df.columns]
+    
+    # Build LaTeX table
+    latex = "\\begin{table}[htbp]\n"
+    latex += "\\centering\n"
+    latex += "\\caption{Model Performance Comparison}\n"
+    latex += "\\label{tab:model_comparison}\n"
+    latex += "\\begin{tabular}{l" + "c" * len(available) + "}\n"
+    latex += "\\toprule\n"
+    latex += "Model & " + " & ".join([m.upper() for m in available]) + " \\\\\n"
+    latex += "\\midrule\n"
+    
+    for _, row in df.iterrows():
+        values = [f"{row[m]:.4f}" if m in row else "-" for m in available]
+        latex += f"{row['model_type']} & " + " & ".join(values) + " \\\\\n"
+    
+    latex += "\\bottomrule\n"
+    latex += "\\end{tabular}\n"
+    latex += "\\end{table}\n"
+    
+    return latex
 
 
 def save_results(
